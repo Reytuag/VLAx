@@ -5,7 +5,7 @@ The repository contains code to train with flow matching a VLA action expert att
 
 The repository also allows to test the trained network on Libero with visualization or not. 
 
-It also include preliminary attempts for on-policy RL to finetune the network on tasks through Flow policy optimization (![paper](https://arxiv.org/abs/2602.02481)). 
+It also include preliminary attempts for on-policy RL to finetune the network on tasks through Flow policy optimization ([paper](https://arxiv.org/abs/2602.02481)). 
 
 Next steps include: 
 * Exploring VLA architecture and parameters changes
