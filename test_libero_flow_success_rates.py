@@ -79,7 +79,7 @@ libero_process = None
 libero_task_name = None  # Task name from LIBERO worker
 libero_task_description = None  # Task description from LIBERO worker
 
-gemma_path = "/home/reytuag/VLA/VLAx/gemma-3-flax-gemma3-4b-it-v1/"
+gemma_path="/home/reytuag/VLA/gemma-3-flax-gemma3-4b-it-v1"
 def _read_json_from_worker():
     """
     Read lines from the worker until we get valid JSON.
@@ -463,7 +463,7 @@ def try_restore_params_from_orbax(checkpoint_dir: str):
     Try to restore train_state from an Orbax checkpoint directory and
     extract the model parameters. Returns (params, metadata) or (None, None).
     """
-    ckpt_root = checkpoint_dir
+    ckpt_root = os.path.abspath(checkpoint_dir)
     # If user passed the run dir, look into its checkpoints/ subdir
     if not os.path.basename(ckpt_root).startswith("checkpoints"):
         ckpt_root = os.path.join(ckpt_root, "checkpoints")
@@ -1315,7 +1315,8 @@ def main():
                         print(f"  Found model in checkpoint directory: {flow_checkpoint}")
                         break
     
-    if not flow_checkpoint:
+    # Fall back to default locations if not found in checkpoint directory
+    if restored_params is None and not flow_checkpoint:
         flow_checkpoint = "flow_model_f_9.npy"
         if not os.path.exists(flow_checkpoint):
             for i in range(180, 0, -1):
@@ -1325,32 +1326,33 @@ def main():
                     print(f"  Final model not found, using {flow_checkpoint} instead")
                     break
     
-    if not os.path.exists(flow_checkpoint):
+    if restored_params is None and (not flow_checkpoint or not os.path.exists(flow_checkpoint)):
         print(f"Error: No state-based flow model checkpoint found!")
         print(f"  Looked in: {checkpoint_dir if checkpoint_dir else 'current directory'}")
         return
     
-    try:
-        model_flow, params_flow, apply_fn = load_flow_model(
-            flow_checkpoint,
-            action_shape=action_shape,
-            action_horizon=action_horizon,
-            num_layers=num_cache_layers
-        )
-        print(f"  ✓ Loaded flow model from {flow_checkpoint}")
-        
-        def count_params(params):
-            return sum([np.prod(p.shape) for p in jax.tree_util.tree_leaves(params)])
-        
-        num_params = count_params(params_flow)
-        print(f"  Model parameters: {num_params:,}")
-        print(f"  Model cache layers: {num_cache_layers}, action_horizon={action_horizon}")
-        
-    except Exception as e:
-        print(f"Error loading flow model: {e}")
-        import traceback
-        traceback.print_exc()
-        return
+    if restored_params is None:
+        try:
+            model_flow, params_flow, apply_fn = load_flow_model(
+                flow_checkpoint,
+                action_shape=action_shape,
+                action_horizon=action_horizon,
+                num_layers=num_cache_layers
+            )
+            print(f"  ✓ Loaded flow model from {flow_checkpoint}")
+            
+            def count_params(params):
+                return sum([np.prod(p.shape) for p in jax.tree_util.tree_leaves(params)])
+            
+            num_params = count_params(params_flow)
+            print(f"  Model parameters: {num_params:,}")
+            print(f"  Model cache layers: {num_cache_layers}, action_horizon={action_horizon}")
+            
+        except Exception as e:
+            print(f"Error loading flow model: {e}")
+            import traceback
+            traceback.print_exc()
+            return
     
     # =========================================================================
     # Step 2: Load vision model (only once, shared across all suites/tasks)
@@ -1362,7 +1364,7 @@ def main():
         try:
             model_vision = gm.nn.IntWrapper(model=gm.nn.Gemma3_4B(), dtype=jnp.int4)
             original_params = gm.ckpts.load_params(
-                os.path.abspath(gemma_path+"gemma3-4b-it")
+                os.path.abspath(gemma_path+"/gemma3-4b-it")
             )
             params_vision = peft.quantize(original_params, method='INT4', checkpoint_kernel_key='w')
             
@@ -1372,7 +1374,7 @@ def main():
             
             print("  Loading tokenizer...")
             tokenizer = gm.text.Gemma3Tokenizer(
-                os.path.abspath(gemma_path+"tokenizer.model")
+                os.path.abspath(gemma_path+"/tokenizer.model")
             )
             
             sampler = Sampler(
@@ -1395,7 +1397,8 @@ def main():
     # Step 3: Create output directory (single folder for everything)
     # =========================================================================
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = f"all_suites_success_rate_diffsteps{num_diffusion_steps}_{timestamp}"
+    results_base = "results"
+    output_dir = os.path.join(results_base, f"all_suites_success_rate_diffsteps{num_diffusion_steps}_{timestamp}")
     os.makedirs(output_dir, exist_ok=True)
     print(f"\n[3/4] All results will be saved to: {output_dir}/")
     
@@ -1652,13 +1655,13 @@ def main():
 
 if __name__ == "__main__":
     # Usage:
-    #   python test_libero_flow_state_server_success_rate_all_suites.py                                                          # All 3 default suites, 10 tasks each, 10 trials per task
-    #   python test_libero_flow_state_server_success_rate_all_suites.py run_20260212_120000                                      # Load config from checkpoint
-    #   python test_libero_flow_state_server_success_rate_all_suites.py --suites libero_spatial,libero_object                    # Only test 2 suites
-    #   python test_libero_flow_state_server_success_rate_all_suites.py --suites libero_spatial,libero_object,libero_goal,libero_10  # Test 4 suites
-    #   python test_libero_flow_state_server_success_rate_all_suites.py --num-trials 20                                          # 20 trials per task
-    #   python test_libero_flow_state_server_success_rate_all_suites.py --num-tasks 5                                            # Only first 5 tasks per suite
-    #   python test_libero_flow_state_server_success_rate_all_suites.py --diffusion-steps 50                                     # 50 diffusion steps
-    #   python test_libero_flow_state_server_success_rate_all_suites.py run_20260212_120000 --suites libero_spatial --num-trials 5 --diffusion-steps 20
+    #   python test_libero_flow_success_rates.py                                                          # All 3 default suites, 10 tasks each, 10 trials per task
+    #   python test_libero_flow_success_rates.py run_20260212_120000                                      # Load config from checkpoint
+    #   python test_libero_flow_success_rates.py --suites libero_spatial,libero_object                    # Only test 2 suites
+    #   python test_libero_flow_success_rates.py --suites libero_spatial,libero_object,libero_goal,libero_10  # Test 4 suites
+    #   python test_libero_flow_success_rates.py --num-trials 20                                          # 20 trials per task
+    #   python test_libero_flow_success_rates.py --num-tasks 5                                            # Only first 5 tasks per suite
+    #   python test_libero_flow_success_rates.py --diffusion-steps 50                                     # 50 diffusion steps
+    #   python test_libero_flow_success_rates.py run_20260212_120000 --suites libero_spatial --num-trials 5 --diffusion-steps 20
     
     main()
