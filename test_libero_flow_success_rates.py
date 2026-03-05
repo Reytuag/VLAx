@@ -46,11 +46,8 @@ import gc
 import numpy as np
 import jax
 import jax.numpy as jnp
-from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
-import h5py
-import subprocess
 import json
 from datetime import datetime
 
@@ -69,351 +66,18 @@ import orbax.checkpoint as ocp
 from flax.training.train_state import TrainState
 import optax
 
+from libero_misc.libero_comms import (
+    start_libero_worker, stop_libero_worker,
+    libero_reset, libero_step, libero_step_batch,
+)
+import libero_misc.libero_comms as libero_comms
+from networks.checkpoint_utils import load_config_from_checkpoint_dir, try_restore_params_from_orbax
+from utils import (
+    create_cache_mask, extract_cache_from_layers,
+    extract_libero_action, create_video_frame, save_trajectory_video,
+)
 
-# ============================================================================
-# LIBERO Worker Process Communication
-# ============================================================================
-
-# Global subprocess for LIBERO environment communication
-libero_process = None
-libero_task_name = None  # Task name from LIBERO worker
-libero_task_description = None  # Task description from LIBERO worker
-
-gemma_path="/home/reytuag/VLA/gemma-3-flax-gemma3-4b-it-v1"
-def _read_json_from_worker():
-    """
-    Read lines from the worker until we get valid JSON.
-    Ignores log spam and prints it as worker logs.
-    """
-    global libero_process
-
-    while True:
-        line = libero_process.stdout.readline()
-        if line == "":
-            raise RuntimeError("LIBERO worker died (EOF)")
-
-        line = line.strip()
-
-        # Skip empty lines
-        if not line:
-            continue
-
-        # Fast JSON heuristic
-        if line[0] not in "{[":
-            print(f"[worker] {line}")
-            continue
-
-        try:
-            return json.loads(line)
-
-        except json.JSONDecodeError:
-            # It looked like JSON but wasn't valid
-            print(f"[worker malformed] {line}")
-            continue
-
-
-def start_libero_worker(task_id: int = 1, task_suite_name: str = "libero_spatial"):
-    """
-    Start the LIBERO worker subprocess.
-    
-    Args:
-        task_id: Index of the task to use (default: 1)
-        task_suite_name: Name of the task suite, e.g. "libero_spatial" or "libero_object" (default: "libero_spatial")
-        
-    Returns:
-        Popen object for the worker process
-    """
-    global libero_process
-    
-    print(f"[info] Starting LIBERO worker process with task_id={task_id}, task_suite='{task_suite_name}'...")
-    try:
-        libero_process = subprocess.Popen(
-            ["/home/reytuag/miniconda3/envs/libero_env/bin/python", "-u", "libero_misc/libero_worker.py", str(task_id), task_suite_name],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,  # Important: use text mode
-            bufsize=1,  # Line buffered
-            universal_newlines=True
-        )
-        print(f"[info] LIBERO worker process started successfully with task_id={task_id}, task_suite='{task_suite_name}'")
-        return libero_process
-    except Exception as e:
-        print(f"[error] Failed to start LIBERO worker: {e}")
-        return None
-
-
-def stop_libero_worker():
-    """
-    Stop the LIBERO worker subprocess.
-    """
-    global libero_process
-    if libero_process is not None:
-        try:
-            libero_process.terminate()
-            libero_process.wait(timeout=5)
-            print("[info] LIBERO worker process terminated")
-        except subprocess.TimeoutExpired:
-            libero_process.kill()
-            print("[info] LIBERO worker process killed")
-        libero_process = None
-
-
-def libero_reset():
-    """
-    Send reset command to LIBERO worker and get initial observation.
-    
-    Returns:
-        Tuple of (agentview_image, eye_in_hand_image, robot_state) as numpy arrays
-    """
-    global libero_process
-    
-    if libero_process is None:
-        raise RuntimeError("LIBERO worker not started. Call start_libero_worker() first.")
-    
-    try:
-        # Send reset command
-        libero_process.stdin.write(json.dumps({"cmd": "reset"}) + "\n")
-        libero_process.stdin.flush()
-        
-        # Read response
-        obs_dict = _read_json_from_worker()
-        
-        # Extract observations
-        if isinstance(obs_dict, dict):
-            # Agentview image
-            if 'agentview_image' in obs_dict:
-                agentview = np.array(obs_dict['agentview_image'], dtype=np.uint8)[::-1] # flip vertically to correct orientation
-                if len(agentview.shape) == 1:
-                    agentview = agentview.reshape(128, 128, 3)
-            else:
-                raise ValueError(f"agentview_image not found in observation")
-            
-            # Eye-in-hand image
-            if 'robot0_eye_in_hand_image' in obs_dict:
-                eye_in_hand = np.array(obs_dict['robot0_eye_in_hand_image'], dtype=np.uint8)
-                if len(eye_in_hand.shape) == 1:
-                    eye_in_hand = eye_in_hand.reshape(128, 128, 3)
-            else:
-                raise ValueError(f"eye_in_hand_image not found in observation")
-            
-            # Robot state (9D: gripper_qpos(2) + eef_pos(3) + eef_quat(4))
-            # This matches the HDF5 robot_states format used in training
-            if 'robot0_gripper_qpos' in obs_dict and 'robot0_eef_pos' in obs_dict and 'robot0_eef_quat' in obs_dict:
-                gripper_qpos = np.array(obs_dict['robot0_gripper_qpos'], dtype=np.float32)
-                eef_pos = np.array(obs_dict['robot0_eef_pos'], dtype=np.float32)
-                eef_quat = np.array(obs_dict['robot0_eef_quat'], dtype=np.float32)
-                # Concatenate to get 9D state: 2 gripper + 3 eef_pos + 4 eef_quat
-                robot_state = np.concatenate([gripper_qpos, eef_pos, eef_quat])
-            elif 'robot0_gripper_qpos' in obs_dict and 'robot0_eef_pos' in obs_dict:
-                gripper_qpos = np.array(obs_dict['robot0_gripper_qpos'], dtype=np.float32)
-                eef_pos = np.array(obs_dict['robot0_eef_pos'], dtype=np.float32)
-                # Pad with identity quaternion if eef_quat not available
-                eef_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-                robot_state = np.concatenate([gripper_qpos, eef_pos, eef_quat])
-            else:
-                # Fallback to dummy state
-                print(f"[warning] Required robot state keys not found, using dummy state")
-                print(f"[warning] Available keys: {list(obs_dict.keys())}")
-                robot_state = np.zeros(9, dtype=np.float32)
-            
-            return agentview, eye_in_hand, robot_state
-        else:
-            raise ValueError(f"Invalid observation format: expected dict, got {type(obs_dict)}")
-    except Exception as e:
-        print(f"[error] Error in libero_reset: {e}")
-        raise
-
-
-def libero_step(action):
-    """
-    Send step command to LIBERO worker with action and get result.
-    
-    Args:
-        action: Action to execute (numpy array or list)
-        
-    Returns:
-        Tuple of (agentview_image, eye_in_hand_image, robot_state, reward, done, info)
-    """
-    global libero_process
-    
-    if libero_process is None:
-        raise RuntimeError("LIBERO worker not started. Call start_libero_worker() first.")
-    
-    try:
-        # Convert action to list if numpy array
-        action_list = action.tolist() if isinstance(action, np.ndarray) else action
-        
-        # Send step command
-        libero_process.stdin.write(json.dumps({
-            "cmd": "step",
-            "action": action_list
-        }) + "\n")
-        libero_process.stdin.flush()
-        
-        # Read response
-        result = _read_json_from_worker()
-        
-        # Extract observation
-        obs_dict = result.get("obs", {})
-        if isinstance(obs_dict, dict):
-            # Agentview image
-            if 'agentview_image' in obs_dict:
-                agentview = np.array(obs_dict['agentview_image'], dtype=np.uint8)[::-1] # flip vertically to correct orientation
-                if len(agentview.shape) == 1:
-                    agentview = agentview.reshape(128, 128, 3)
-            else:
-                print(f"[warning] agentview_image not found, creating dummy")
-                agentview = np.zeros((128, 128, 3), dtype=np.uint8)
-            
-            # Eye-in-hand image
-            if 'robot0_eye_in_hand_image' in obs_dict:
-                eye_in_hand = np.array(obs_dict['robot0_eye_in_hand_image'], dtype=np.uint8)
-                if len(eye_in_hand.shape) == 1:
-                    eye_in_hand = eye_in_hand.reshape(128, 128, 3)
-            else:
-                print(f"[warning] eye_in_hand_image not found, creating dummy")
-                eye_in_hand = np.zeros((128, 128, 3), dtype=np.uint8)
-            
-            # Robot state (9D: gripper_qpos(2) + eef_pos(3) + eef_quat(4))
-            # This matches the HDF5 robot_states format used in training
-            if 'robot0_gripper_qpos' in obs_dict and 'robot0_eef_pos' in obs_dict and 'robot0_eef_quat' in obs_dict:
-                gripper_qpos = np.array(obs_dict['robot0_gripper_qpos'], dtype=np.float32)
-                eef_pos = np.array(obs_dict['robot0_eef_pos'], dtype=np.float32)
-                eef_quat = np.array(obs_dict['robot0_eef_quat'], dtype=np.float32)
-                # Concatenate to get 9D state: 2 gripper + 3 eef_pos + 4 eef_quat
-                robot_state = np.concatenate([gripper_qpos, eef_pos, eef_quat])
-            elif 'robot0_gripper_qpos' in obs_dict and 'robot0_eef_pos' in obs_dict:
-                gripper_qpos = np.array(obs_dict['robot0_gripper_qpos'], dtype=np.float32)
-                eef_pos = np.array(obs_dict['robot0_eef_pos'], dtype=np.float32)
-                # Pad with identity quaternion if eef_quat not available
-                eef_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-                robot_state = np.concatenate([gripper_qpos, eef_pos, eef_quat])
-            else:
-                robot_state = np.zeros(9, dtype=np.float32)
-        else:
-            # Fallback
-            agentview = np.zeros((128, 128, 3), dtype=np.uint8)
-            eye_in_hand = np.zeros((128, 128, 3), dtype=np.uint8)
-            robot_state = np.zeros(9, dtype=np.float32)
-        
-        reward = float(result.get("reward", 0.0))
-        done = bool(result.get("done", False))
-        info = result.get("info", {})
-        
-        return agentview, eye_in_hand, robot_state, reward, done, info
-    except Exception as e:
-        print(f"[error] Error in libero_step: {e}")
-        raise
-
-
-def libero_step_batch(actions):
-    """
-    Send a batch of actions to the LIBERO worker in a single IPC call.
-
-    The worker executes all actions sequentially and returns only the final
-    observation together with per-step rewards / dones.  This avoids one
-    JSON round-trip per timestep and dramatically reduces IPC overhead.
-
-    Args:
-        actions: List of actions (each a list/numpy array of length action_dim)
-
-    Returns:
-        Tuple of (agentview, eye_in_hand, robot_state, rewards, dones, info, steps_executed)
-        - rewards: list of float, one per executed step
-        - dones: list of bool, one per executed step
-        - steps_executed: int, may be < len(actions) if done early
-    """
-    global libero_process
-
-    if libero_process is None:
-        raise RuntimeError("LIBERO worker not started. Call start_libero_worker() first.")
-
-    # Convert numpy arrays to plain lists for JSON serialisation
-    action_lists = [
-        a.tolist() if isinstance(a, np.ndarray) else list(a) for a in actions
-    ]
-
-    try:
-        libero_process.stdin.write(
-            json.dumps({"cmd": "step_batch", "actions": action_lists}) + "\n"
-        )
-        libero_process.stdin.flush()
-
-        result = _read_json_from_worker()
-
-        # ---- parse final observation (same logic as libero_step) ----
-        obs_dict = result.get("obs", {})
-        if isinstance(obs_dict, dict):
-            if "agentview_image" in obs_dict:
-                agentview = np.array(obs_dict["agentview_image"], dtype=np.uint8)[::-1]
-                if len(agentview.shape) == 1:
-                    agentview = agentview.reshape(128, 128, 3)
-            else:
-                agentview = np.zeros((128, 128, 3), dtype=np.uint8)
-
-            if "robot0_eye_in_hand_image" in obs_dict:
-                eye_in_hand = np.array(obs_dict["robot0_eye_in_hand_image"], dtype=np.uint8)
-                if len(eye_in_hand.shape) == 1:
-                    eye_in_hand = eye_in_hand.reshape(128, 128, 3)
-            else:
-                eye_in_hand = np.zeros((128, 128, 3), dtype=np.uint8)
-
-            if (
-                "robot0_gripper_qpos" in obs_dict
-                and "robot0_eef_pos" in obs_dict
-                and "robot0_eef_quat" in obs_dict
-            ):
-                robot_state = np.concatenate([
-                    np.array(obs_dict["robot0_gripper_qpos"], dtype=np.float32),
-                    np.array(obs_dict["robot0_eef_pos"], dtype=np.float32),
-                    np.array(obs_dict["robot0_eef_quat"], dtype=np.float32),
-                ])
-            elif "robot0_gripper_qpos" in obs_dict and "robot0_eef_pos" in obs_dict:
-                robot_state = np.concatenate([
-                    np.array(obs_dict["robot0_gripper_qpos"], dtype=np.float32),
-                    np.array(obs_dict["robot0_eef_pos"], dtype=np.float32),
-                    np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-                ])
-            else:
-                robot_state = np.zeros(9, dtype=np.float32)
-        else:
-            agentview = np.zeros((128, 128, 3), dtype=np.uint8)
-            eye_in_hand = np.zeros((128, 128, 3), dtype=np.uint8)
-            robot_state = np.zeros(9, dtype=np.float32)
-
-        rewards = result.get("rewards", [])
-        dones = result.get("dones", [])
-        info = result.get("info", {})
-        steps_executed = int(result.get("steps_executed", len(rewards)))
-
-        return agentview, eye_in_hand, robot_state, rewards, dones, info, steps_executed
-
-    except Exception as e:
-        print(f"[error] Error in libero_step_batch: {e}")
-        raise
-
-
-def load_config_from_checkpoint_dir(checkpoint_dir: str) -> Optional[Dict]:
-    """
-    Load configuration from a checkpoint directory.
-    
-    Args:
-        checkpoint_dir: Path to the directory containing config.json
-        
-    Returns:
-        Dictionary with configuration, or None if config.json not found
-    """
-    import json
-    config_path = os.path.join(checkpoint_dir, "config.json")
-    if os.path.exists(config_path):
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-        print(f"[info] Loaded configuration from: {config_path}")
-        return config
-    else:
-        print(f"[warning] Configuration file not found at: {config_path}")
-        return None
+gemma_path = "/home/reytuag/VLA/gemma-3-flax-gemma3-4b-it-v1"
 
 
 def load_flow_model(
@@ -456,226 +120,6 @@ def load_flow_model(
     apply_fn = jax.jit(model_flow.apply)
     
     return model_flow, params, apply_fn
-
-
-def try_restore_params_from_orbax(checkpoint_dir: str):
-    """
-    Try to restore train_state from an Orbax checkpoint directory and
-    extract the model parameters. Returns (params, metadata) or (None, None).
-    """
-    ckpt_root = os.path.abspath(checkpoint_dir)
-    # If user passed the run dir, look into its checkpoints/ subdir
-    if not os.path.basename(ckpt_root).startswith("checkpoints"):
-        ckpt_root = os.path.join(ckpt_root, "checkpoints")
-
-    if not os.path.isdir(ckpt_root):
-        print(f"[info] Orbax checkpoint dir not found at: {ckpt_root}")
-        return None, None
-
-    try:
-        options = ocp.CheckpointManagerOptions(max_to_keep=3)
-        manager = ocp.CheckpointManager(directory=ckpt_root, options=options)
-        latest = manager.latest_step()
-        if latest is None:
-            print(f"[info] No orbax checkpoints found in {ckpt_root}")
-            return None, None
-
-        print(f"[info] Restoring Orbax checkpoint at step: {latest}")
-
-        restored = manager.restore(
-            latest,
-            args=ocp.args.Composite(
-                train_state=ocp.args.PyTreeRestore(),
-                metadata=ocp.args.JsonRestore(),
-            ),
-        )
-
-        # The restored.train_state may be a nested dict. Try common locations for params.
-        ts = restored.train_state
-        metadata = getattr(restored, 'metadata', None)
-
-        # params could be under ts['params'] or ts.params
-        params = None
-        if isinstance(ts, dict):
-            if 'params' in ts:
-                params = ts['params']
-            elif 'train_state' in ts and isinstance(ts['train_state'], dict) and 'params' in ts['train_state']:
-                params = ts['train_state']['params']
-        else:
-            # try attribute access
-            params = getattr(ts, 'params', None)
-
-        if params is None:
-            print(f"[warning] Could not find 'params' in restored train_state. Keys: {list(ts.keys()) if isinstance(ts, dict) else dir(ts)}")
-            return None, metadata
-
-        # Convert numpy arrays to jax arrays if needed
-        params = jax.tree_util.tree_map(lambda x: jnp.asarray(x), params)
-        print(f"[info] Restored params from Orbax checkpoint (step={latest})")
-        return params, metadata
-
-    except Exception as e:
-        print(f"[error] Failed to restore Orbax checkpoint: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, None
-
-
-def create_cache_mask(indices, key_length, query_length, num_heads):
-    """
-    Create attention mask for the cache.
-    
-    Args:
-        indices: End indices for each sequence in batch
-        key_length: Length of key cache dimension
-        query_length: Length of query sequence
-        num_heads: Number of attention heads
-        
-    Returns:
-        Attention mask tensor
-    """
-    mask = jnp.arange(key_length)[None, :] < indices[:, None]
-    mask = mask[:, None, None, :].repeat(num_heads, axis=1).repeat(query_length, axis=2)
-    return mask
-
-
-def extract_cache_from_layers(cache_dict, layer_names, cache_type="k"):
-    """
-    Extract and concatenate cache tensors from specified layers.
-    
-    Args:
-        cache_dict: Dictionary containing cache for all layers
-        layer_names: List of layer names to extract (e.g., ["layer_9", "layer_26", "layer_31"])
-        cache_type: Either "k" or "v" for key or value cache
-        
-    Returns:
-        Concatenated cache tensor with shape (batch, num_layers, seq_len, num_heads, head_dim)
-    """
-    cache_tensors = []
-    for layer_name in layer_names:
-        cache_tensors.append(cache_dict[layer_name][cache_type][:, None, ...])
-    return jnp.concatenate(cache_tensors, axis=1)
-
-
-def create_video_frame(agentview_image: np.ndarray, eye_in_hand_image: np.ndarray, 
-                       task_description: str, step: int, trial_num: int = None,
-                       suite_name: str = None, task_id: int = None) -> np.ndarray:
-    """
-    Create a video frame with concatenated dual-view images and task descriptor on top.
-    
-    Args:
-        agentview_image: RGB image from agentview camera (H, W, 3)
-        eye_in_hand_image: RGB image from eye-in-hand camera (H, W, 3)
-        task_description: Task description text to display
-        step: Current step number
-        trial_num: Trial number (optional, for multi-trial testing)
-        suite_name: Task suite name (optional)
-        task_id: Task ID (optional)
-        
-    Returns:
-        Combined frame as numpy array (H_total, W, 3) with uint8 dtype
-    """
-    # Ensure images are uint8
-    agentview = agentview_image.astype(np.uint8)
-    eye_in_hand = eye_in_hand_image.astype(np.uint8)
-    
-    # Get dimensions
-    h, w, c = agentview.shape
-    
-    # Create text header using PIL for better text rendering
-    text_height = 60
-    header_width = w * 2  # Two images side by side
-    
-    # Create PIL Image for header
-    header_img = Image.new('RGB', (header_width, text_height), color=(40, 40, 40))
-    draw = ImageDraw.Draw(header_img)
-    
-    # Try to use a nice font, fall back to default if not available
-    try:
-        font_task = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
-        font_step = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
-    except:
-        font_task = ImageFont.load_default()
-        font_step = ImageFont.load_default()
-    
-    # Draw task description and step number
-    task_text = f"Task: {task_description}"
-    parts = []
-    if suite_name is not None:
-        parts.append(f"Suite: {suite_name}")
-    if task_id is not None:
-        parts.append(f"Task {task_id}")
-    if trial_num is not None:
-        parts.append(f"Trial {trial_num}")
-    parts.append(f"Step: {step}")
-    step_text = " | ".join(parts)
-    
-    draw.text((10, 10), task_text, fill=(255, 255, 255), font=font_task)
-    draw.text((10, 35), step_text, fill=(200, 200, 200), font=font_step)
-    
-    # Convert header to numpy
-    header_array = np.array(header_img)
-    
-    # Concatenate images horizontally
-    dual_view = np.concatenate([agentview, eye_in_hand], axis=1)
-    
-    # Stack header on top of dual view
-    final_frame = np.concatenate([header_array, dual_view], axis=0)
-    
-    return final_frame
-
-
-def save_trajectory_video(trajectory: Dict, task_description: str, output_path: str, fps: int = 10,
-                          trial_num: int = None, suite_name: str = None, task_id: int = None):
-    """
-    Save trajectory as a video with concatenated dual-view images and task descriptor.
-    
-    Args:
-        trajectory: Dictionary containing 'agentview_observations' and 'eye_in_hand_observations'
-        task_description: Task description to display in video
-        output_path: Path to save the video file
-        fps: Frames per second for the video
-        trial_num: Trial number (optional, for multi-trial testing)
-        suite_name: Task suite name (optional)
-        task_id: Task ID (optional)
-    """
-    print(f"\n[info] Saving trajectory video to {output_path}...")
-    
-    # Import cv2 here to avoid import errors when not saving video
-    try:
-        import cv2
-    except ImportError as e:
-        print(f"[error] Failed to import cv2: {e}")
-        print("  Please install opencv-python: pip install opencv-python")
-        return
-    
-    agentview_obs = trajectory['agentview_observations']
-    eye_in_hand_obs = trajectory['eye_in_hand_observations']
-    
-    if len(agentview_obs) == 0 or len(eye_in_hand_obs) == 0:
-        print("[warning] No observations to save")
-        return
-    
-    # Create first frame to get dimensions
-    first_frame = create_video_frame(agentview_obs[0], eye_in_hand_obs[0], task_description, 0,
-                                     trial_num, suite_name, task_id)
-    height, width, _ = first_frame.shape
-    
-    # Initialize video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    
-    # Write all frames
-    num_frames = min(len(agentview_obs), len(eye_in_hand_obs))
-    for i in range(num_frames):
-        frame = create_video_frame(agentview_obs[i], eye_in_hand_obs[i], task_description, i,
-                                   trial_num, suite_name, task_id)
-        # Convert RGB to BGR for OpenCV
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        out.write(frame_bgr)
-    
-    out.release()
-    print(f"  ✓ Video saved: {output_path} ({num_frames} frames at {fps} fps)")
 
 
 import functools
@@ -784,38 +228,6 @@ def sample_actions_from_flow(
     return x_final
 
 
-def extract_libero_action(action_array: np.ndarray, action_idx: int = 0) -> Dict:
-    """
-    Convert action array to interpretable LIBERO action format.
-    
-    Args:
-        action_array: Action from flow model (shape: [batch, horizon, 7])
-                      Format: [ee_x, ee_y, ee_z, qx, qy, qz, gripper]
-        action_idx: Which action in the sequence to use
-        
-    Returns:
-        Dictionary with LIBERO action components
-    """
-    action = action_array[action_idx]
-    
-    # Parse action components
-    ee_x = float(action[0])
-    ee_y = float(action[1])
-    ee_z = float(action[2])
-    qx = float(action[3])
-    qy = float(action[4])
-    qz = float(action[5])
-    gripper = float(action[6])
-    
-    action_dict = {
-        'ee_pos': np.array([ee_x, ee_y, ee_z]),
-        'ee_ori_partial': np.array([qx, qy, qz]),  # Partial quaternion (w is implicit)
-        'gripper': 1.0 if gripper > 0.5 else 0.0,  # Binary: 0=open, 1=closed
-    }
-    
-    return action_dict
-
-
 def test_policy_in_environment_closed_loop(
     model_flow,
     params_flow,
@@ -860,8 +272,7 @@ def test_policy_in_environment_closed_loop(
     print(f"\n[info] Testing policy with closed-loop control{trial_str} ({num_replans} replans, {steps_per_replan} steps per replan)")
     
     # Use task information from LIBERO worker if not provided explicitly
-    global libero_task_name, libero_task_description
-    effective_task_instruction = libero_task_description
+    effective_task_instruction = libero_comms.libero_task_description
     
     # Get initial observation from LIBERO worker
     agentview, eye_in_hand, robot_state = libero_reset()
@@ -1434,19 +845,18 @@ def main():
                 libero_worker_started = True
                 print(f"  ✓ LIBERO worker started for {suite_name} task {task_id}")
                 print("[info] Waiting for worker ready signal...")
-                msg = _read_json_from_worker()
+                msg = libero_comms._read_json_from_worker()
                 print("[info] Worker ready:", msg)
                 
-                global libero_task_name, libero_task_description
-                libero_task_name = msg.get("task_name", "Unknown Task")
-                libero_task_description = msg.get("task_description", "")
-                print(f"[info] Task name: {libero_task_name}")
-                print(f"[info] Task description: {libero_task_description}")
+                libero_comms.libero_task_name = msg.get("task_name", "Unknown Task")
+                libero_comms.libero_task_description = msg.get("task_description", "")
+                print(f"[info] Task name: {libero_comms.libero_task_name}")
+                print(f"[info] Task description: {libero_comms.libero_task_description}")
                 
                 # Test reset to verify observations
-                libero_process.stdin.write(json.dumps({"cmd": "reset"}) + "\n")
-                libero_process.stdin.flush()
-                obs = _read_json_from_worker()
+                libero_comms.libero_process.stdin.write(json.dumps({"cmd": "reset"}) + "\n")
+                libero_comms.libero_process.stdin.flush()
+                obs = libero_comms._read_json_from_worker()
                 print(f"[info] Observation keys: {obs.keys() if isinstance(obs, dict) else 'not a dict'}")
                 
             except Exception as e:
@@ -1484,7 +894,7 @@ def main():
                         action_horizon=action_horizon,
                         num_diffusion_steps=num_diffusion_steps,
                         sampler=sampler,
-                        task_instruction=libero_task_description,
+                        task_instruction=libero_comms.libero_task_description,
                         num_replans=16,
                         steps_per_replan=16,
                         config=config,
@@ -1504,8 +914,8 @@ def main():
                         'episode_length': episode_length,
                         'num_replans': num_replans_used,
                         'video_path': None,
-                        'task_name': libero_task_name,
-                        'task_description': libero_task_description
+                        'task_name': libero_comms.libero_task_name,
+                        'task_description': libero_comms.libero_task_description
                     }
                     
                     print(f"\n  Trial {trial_num} Results:")
@@ -1520,7 +930,7 @@ def main():
                     try:
                         save_trajectory_video(
                             trajectory=trajectory,
-                            task_description=libero_task_description,
+                            task_description=libero_comms.libero_task_description,
                             output_path=video_path,
                             fps=10,
                             trial_num=trial_num,
@@ -1549,8 +959,8 @@ def main():
                         'episode_length': 0,
                         'num_replans': 0,
                         'video_path': None,
-                        'task_name': libero_task_name,
-                        'task_description': libero_task_description,
+                        'task_name': libero_comms.libero_task_name,
+                        'task_description': libero_comms.libero_task_description,
                         'error': str(e)
                     })
             
@@ -1559,7 +969,7 @@ def main():
             # Print per-task summary
             task_successes = sum(1 for r in task_trial_results if r['success'])
             task_rate = (task_successes / len(task_trial_results) * 100) if task_trial_results else 0.0
-            print(f"\n  >> Task {task_id} ({libero_task_name}): {task_rate:.1f}% ({task_successes}/{len(task_trial_results)})")
+            print(f"\n  >> Task {task_id} ({libero_comms.libero_task_name}): {task_rate:.1f}% ({task_successes}/{len(task_trial_results)})")
             
             # Stop worker for this task before moving to next
             if libero_worker_started:

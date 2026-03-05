@@ -99,3 +99,96 @@ def restore_checkpoint(checkpoint_manager, train_state_template):
     metadata = restored.metadata
     print(f"  ✓ Restored: step={metadata['global_step']}, epoch={metadata['epoch']}")
     return train_state, metadata
+
+
+def load_config_from_checkpoint_dir(checkpoint_dir: str):
+    """
+    Load configuration from a checkpoint directory's config.json.
+
+    Args:
+        checkpoint_dir: Path to the directory containing config.json
+
+    Returns:
+        Dictionary with configuration, or None if config.json not found
+    """
+    import json
+
+    config_path = os.path.join(checkpoint_dir, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        print(f"[info] Loaded configuration from: {config_path}")
+        return config
+    else:
+        print(f"[warning] Configuration file not found at: {config_path}")
+        return None
+
+
+def try_restore_params_from_orbax(checkpoint_dir: str):
+    """
+    Try to restore train_state from an Orbax checkpoint directory and
+    extract the model parameters.
+
+    Returns:
+        (params, metadata) or (None, None) if restoration fails.
+    """
+    import jax.numpy as jnp
+    import traceback
+
+    ckpt_root = os.path.abspath(checkpoint_dir)
+    # If user passed the run dir, look into its checkpoints/ subdir
+    if not os.path.basename(ckpt_root).startswith("checkpoints"):
+        ckpt_root = os.path.join(ckpt_root, "checkpoints")
+
+    if not os.path.isdir(ckpt_root):
+        print(f"[info] Orbax checkpoint dir not found at: {ckpt_root}")
+        return None, None
+
+    try:
+        options = ocp.CheckpointManagerOptions(max_to_keep=3)
+        manager = ocp.CheckpointManager(directory=ckpt_root, options=options)
+        latest = manager.latest_step()
+        if latest is None:
+            print(f"[info] No orbax checkpoints found in {ckpt_root}")
+            return None, None
+
+        print(f"[info] Restoring Orbax checkpoint at step: {latest}")
+
+        restored = manager.restore(
+            latest,
+            args=ocp.args.Composite(
+                train_state=ocp.args.PyTreeRestore(),
+                metadata=ocp.args.JsonRestore(),
+            ),
+        )
+
+        # The restored.train_state may be a nested dict.
+        ts = restored.train_state
+        metadata = getattr(restored, 'metadata', None)
+
+        # params could be under ts['params'] or ts.params
+        params = None
+        if isinstance(ts, dict):
+            if 'params' in ts:
+                params = ts['params']
+            elif ('train_state' in ts
+                  and isinstance(ts['train_state'], dict)
+                  and 'params' in ts['train_state']):
+                params = ts['train_state']['params']
+        else:
+            params = getattr(ts, 'params', None)
+
+        if params is None:
+            keys_info = list(ts.keys()) if isinstance(ts, dict) else dir(ts)
+            print(f"[warning] Could not find 'params' in restored train_state. Keys: {keys_info}")
+            return None, metadata
+
+        # Convert numpy arrays to jax arrays if needed
+        params = jax.tree_util.tree_map(lambda x: jnp.asarray(x), params)
+        print(f"[info] Restored params from Orbax checkpoint (step={latest})")
+        return params, metadata
+
+    except Exception as e:
+        print(f"[error] Failed to restore Orbax checkpoint: {e}")
+        traceback.print_exc()
+        return None, None
