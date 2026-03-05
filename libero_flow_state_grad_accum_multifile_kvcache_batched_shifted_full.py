@@ -101,7 +101,7 @@ config = {
     "action_horizon": action_horizon,
     "num_diffusion_steps": 10,
     "task_suite_name": "libero_spatial_object",
-    "num_epochs": 150,
+    "num_epochs": 35,
     "LR": 4e-4,
     "ANNEAL_LR": True,
     "LR_SCHEDULE_TYPE": "cosine",  # Options: "linear", "cosine"
