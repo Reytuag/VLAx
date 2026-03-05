@@ -1,3 +1,4 @@
 run*/
 wandb/
 __pycache__/
+trajectories/

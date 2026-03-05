@@ -79,7 +79,7 @@ libero_process = None
 libero_task_name = None  # Task name from LIBERO worker
 libero_task_description = None  # Task description from LIBERO worker
 
-
+gemma_path = "/home/reytuag/VLA/VLAx/gemma-3-flax-gemma3-4b-it-v1/"
 def _read_json_from_worker():
     """
     Read lines from the worker until we get valid JSON.
@@ -128,7 +128,7 @@ def start_libero_worker(task_id: int = 1, task_suite_name: str = "libero_spatial
     print(f"[info] Starting LIBERO worker process with task_id={task_id}, task_suite='{task_suite_name}'...")
     try:
         libero_process = subprocess.Popen(
-            ["/home/reytuag/miniconda3/envs/libero/bin/python", "-u", "libero_worker.py", str(task_id), task_suite_name],
+            ["/home/reytuag/miniconda3/envs/libero_env/bin/python", "-u", "libero_misc/libero_worker.py", str(task_id), task_suite_name],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1362,7 +1362,7 @@ def main():
         try:
             model_vision = gm.nn.IntWrapper(model=gm.nn.Gemma3_4B(), dtype=jnp.int4)
             original_params = gm.ckpts.load_params(
-                os.path.abspath("../../gemma-3-flax-gemma3-4b-it-v1/gemma3-4b-it")
+                os.path.abspath(gemma_path+"gemma3-4b-it")
             )
             params_vision = peft.quantize(original_params, method='INT4', checkpoint_kernel_key='w')
             
@@ -1372,7 +1372,7 @@ def main():
             
             print("  Loading tokenizer...")
             tokenizer = gm.text.Gemma3Tokenizer(
-                "../../gemma-3-flax-gemma3-4b-it-v1/tokenizer.model"
+                os.path.abspath(gemma_path+"tokenizer.model")
             )
             
             sampler = Sampler(

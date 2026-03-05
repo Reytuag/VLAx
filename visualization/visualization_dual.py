@@ -236,8 +236,8 @@ class RealtimeAgentVisualizerDual:
             step_labels = ['Step 1', 'Step 5', 'Step 10']
             
             # Create blank attention for initialization (will be updated dynamically)
-            # Start with a reasonable default size
-            blank_attn = np.zeros((17, 1041))  # Default: 17 queries, 1041 keys
+            # Start with a reasonable default size: 17 queries, 256 VLM cache + 17 action = 273 keys
+            blank_attn = np.zeros((17, 273))
             
             # Dynamically create grid spec based on num_layers
             gs_mosaic = gridspec.GridSpecFromSubplotSpec(self.num_layers, 4, subplot_spec=gs_outer[2], 
@@ -409,10 +409,12 @@ class RealtimeAgentVisualizerDual:
         """
         Initialize highlighting rectangles for all attention visualizations (called once).
         
+        Highlights the separation between the first 256 VLM cache keys and the last 17 action keys.
+        
         Args:
             query_len: Number of queries
-            vlm_cache_length: Length of VLM cache
-            action_self_attn_length: Length of action self-attention
+            vlm_cache_length: Length of VLM cache (expected 256)
+            action_self_attn_length: Length of action self-attention (expected 17)
         """
         from matplotlib.patches import Rectangle
         
@@ -420,20 +422,13 @@ class RealtimeAgentVisualizerDual:
         
         # Initialize rectangles for all (step, layer) combinations
         for (step_idx, layer_idx), ax in self.step_mosaic_axes.items():
-            # Add VLM cache region (0 to vlm_cache_length)
-            if vlm_cache_length > 0:
-                rect_vlm = Rectangle((-0.5, -0.5), vlm_cache_length, query_len,
-                                    linewidth=1, edgecolor='cyan', facecolor='none', linestyle='--', alpha=0.7)
-                ax.add_patch(rect_vlm)
-            
-            # Add action self-attention region (vlm_cache_length to end)
-            if action_self_attn_length > 0:
-                rect_act = Rectangle((vlm_cache_length - 0.5, -0.5), action_self_attn_length, query_len,
-                                    linewidth=1, edgecolor='lime', facecolor='none', linestyle=':', alpha=0.7)
-                ax.add_patch(rect_act)
+            # Add green dotted contour around the full attention map
+            rect_full = Rectangle((-0.5, -0.5), total_key_length, query_len,
+                                  linewidth=2, edgecolor='lime', facecolor='none', linestyle=':', alpha=0.8)
+            ax.add_patch(rect_full)
             
             # Update axis labels with actual dimensions
-            ax.set_xlabel(f'Key (VLM 0-{vlm_cache_length} | Act {vlm_cache_length}-{total_key_length})', fontsize=5)
+            ax.set_xlabel(f'Key (0-{total_key_length})', fontsize=5)
             ax.set_ylabel(f'Query (0-{query_len})', fontsize=5)
         
         self.attention_dims_initialized = True
@@ -515,17 +510,13 @@ class RealtimeAgentVisualizerDual:
                 query_len = attn.shape[0]
                 total_key_length = attn.shape[1]
                 
-                # Infer action_self_attn_length from query_len
-                # Assumption: query_len = action_horizon + 1 (state token)
-                # action_self_attn_length = query_len (includes all action queries + state)
-                action_self_attn_length = query_len
+                # Fixed boundary: first 256 keys are VLM cache, last 17 are action self-attention
+                vlm_cache_length = 256
+                action_self_attn_length = total_key_length - vlm_cache_length
                 
-                # Calculate vlm_cache_length
-                vlm_cache_length = total_key_length - action_self_attn_length
-                
-                # Ensure vlm_cache_length is non-negative
-                if vlm_cache_length < 0:
-                    # If negative, assume no VLM cache separation
+                # Ensure dimensions are reasonable
+                if action_self_attn_length < 0:
+                    # If total key length is less than 256, assume no fixed boundary
                     vlm_cache_length = 0
                     action_self_attn_length = total_key_length
                 
@@ -554,13 +545,19 @@ class RealtimeAgentVisualizerDual:
                 first_layer = processed_layers[0]
                 query_len = first_layer.shape[0]
                 total_key_length = first_layer.shape[1]
-                action_self_attn_length = query_len
-                vlm_cache_length = total_key_length - action_self_attn_length
+                
+                # Fixed boundary: first 256 keys are VLM cache, last 17 are action self-attention
+                vlm_cache_length = 256
+                action_self_attn_length = total_key_length - vlm_cache_length
+                
+                if action_self_attn_length < 0:
+                    vlm_cache_length = 0
+                    action_self_attn_length = total_key_length
                 
                 dim_info = {
                     'query_len': query_len,
                     'total_key_length': total_key_length,
-                    'vlm_cache_length': max(0, vlm_cache_length),
+                    'vlm_cache_length': vlm_cache_length,
                     'action_self_attn_length': action_self_attn_length
                 }
                 
@@ -776,6 +773,19 @@ class RealtimeAgentVisualizerDual:
             self.fig.canvas.flush_events()
             plt.pause(pause_time)
     
+    def render_to_array(self) -> np.ndarray:
+        """
+        Render the current figure to a numpy RGB array.
+        
+        Returns:
+            RGB image as numpy array (H, W, 3) with uint8 dtype
+        """
+        self.fig.canvas.draw()
+        buf = self.fig.canvas.buffer_rgba()
+        img = np.asarray(buf)
+        # Convert RGBA to RGB
+        return img[:, :, :3].copy()
+    
     def close(self):
         """Close the visualization window."""
         self.is_running = False
@@ -833,3 +843,210 @@ class SimpleImageViewer:
             self.fig = None
             self.ax = None
             self.im = None
+
+
+def render_attention_video_frame(
+    agentview_image: np.ndarray,
+    eye_in_hand_image: np.ndarray,
+    task_description: str,
+    step: int,
+    reward: float = 0.0,
+    robot_state: Optional[np.ndarray] = None,
+    attention_weights: Optional[dict] = None,
+    cache_layers: Optional[List[str]] = None,
+    vlm_cache_length: int = 256,
+    fig_ref: Optional[dict] = None,
+) -> Tuple[np.ndarray, Optional[dict]]:
+    """
+    Render a single video frame with dual camera views and attention heatmaps.
+    
+    Creates a matplotlib figure matching the realtime visualization layout,
+    renders it to a numpy array, and returns it. The figure is reused across
+    calls for performance via the fig_ref dict.
+    
+    Args:
+        agentview_image: RGB image from agentview camera (H, W, 3)
+        eye_in_hand_image: RGB image from eye-in-hand camera (H, W, 3)
+        task_description: Task description text
+        step: Current step number
+        reward: Current reward
+        robot_state: Robot state vector (9D)
+        attention_weights: Dict mapping diffusion step index to attention weights
+        cache_layers: List of layer names (e.g., ["layer_9", "layer_26", "layer_31"])
+        vlm_cache_length: Number of VLM cache keys (boundary for highlighting)
+        fig_ref: Mutable dict to persist figure state between calls.
+                 Pass {} on first call; it will be populated with reusable objects.
+    
+    Returns:
+        Tuple of (frame_array, fig_ref):
+        - frame_array: RGB image as numpy array (H, W, 3) with uint8 dtype
+        - fig_ref: Updated fig_ref dict for reuse
+    """
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend for rendering
+    
+    if cache_layers is None:
+        cache_layers = ["layer_9", "layer_26", "layer_31"]
+    num_layers = len(cache_layers)
+    diffusion_steps_to_show = [0, 4, 9]
+    step_labels = ['Step 1', 'Step 5', 'Step 10']
+    
+    # ---- First-time setup: create figure and axes ----
+    if fig_ref is None:
+        fig_ref = {}
+    
+    if 'fig' not in fig_ref:
+        fig = plt.figure(figsize=(18, 12), dpi=150)
+        fig.suptitle('Trajectory Visualization with Attention Maps', fontsize=12, fontweight='bold')
+        
+        gs_outer = gridspec.GridSpec(2, 1, figure=fig, height_ratios=[1.0, 1.5], hspace=0.30)
+        
+        # Top row: [agentview] [eye-in-hand] [info]
+        gs_top = gridspec.GridSpecFromSubplotSpec(1, 3, subplot_spec=gs_outer[0], wspace=0.3)
+        
+        ax_agent = fig.add_subplot(gs_top[0, 0])
+        ax_agent.set_title('Agent View', fontsize=10, fontweight='bold')
+        ax_agent.axis('off')
+        im_agent = ax_agent.imshow(agentview_image, origin='upper')
+        
+        ax_eye = fig.add_subplot(gs_top[0, 1])
+        ax_eye.set_title('Eye-in-Hand View', fontsize=10, fontweight='bold')
+        ax_eye.axis('off')
+        im_eye = ax_eye.imshow(eye_in_hand_image, origin='upper')
+        
+        ax_info = fig.add_subplot(gs_top[0, 2])
+        ax_info.axis('off')
+        text_info = ax_info.text(
+            0.05, 0.95, '', transform=ax_info.transAxes,
+            fontsize=8, verticalalignment='top', family='monospace'
+        )
+        
+        # Bottom: attention mosaic  (num_layers rows × 3 columns + colorbar column)
+        gs_mosaic = gridspec.GridSpecFromSubplotSpec(
+            num_layers, 4, subplot_spec=gs_outer[1], hspace=0.30, wspace=0.40
+        )
+        
+        attn_axes = {}
+        attn_images = {}
+        blank_attn = np.zeros((17, 273))  # Default placeholder
+        
+        for layer_idx in range(num_layers):
+            layer_name = cache_layers[layer_idx]
+            for step_col, (step_idx, step_label) in enumerate(zip(diffusion_steps_to_show, step_labels)):
+                ax = fig.add_subplot(gs_mosaic[layer_idx, step_col])
+                ax.set_title(f'{step_label}-{layer_name}', fontsize=7, fontweight='bold')
+                im = ax.imshow(blank_attn, cmap='hot', aspect='auto', vmin=0, vmax=1)
+                ax.set_xlabel('Key Index', fontsize=5)
+                ax.set_ylabel('Query Index', fontsize=5)
+                ax.tick_params(labelsize=4)
+                attn_axes[(step_idx, layer_idx)] = ax
+                attn_images[(step_idx, layer_idx)] = im
+        
+        # Colorbar
+        ax_cbar = fig.add_subplot(gs_mosaic[:, 3])
+        ax_cbar.axis('off')
+        sm = plt.cm.ScalarMappable(cmap='hot', norm=plt.Normalize(vmin=0, vmax=1))
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax_cbar, pad=0.1, fraction=0.8, aspect=20)
+        cbar.set_label('Attn Weight', fontsize=7, labelpad=10)
+        cbar.ax.tick_params(labelsize=6)
+        
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        
+        fig_ref['fig'] = fig
+        fig_ref['im_agent'] = im_agent
+        fig_ref['im_eye'] = im_eye
+        fig_ref['text_info'] = text_info
+        fig_ref['attn_axes'] = attn_axes
+        fig_ref['attn_images'] = attn_images
+        fig_ref['rects_initialized'] = False
+    
+    # ---- Update data ----
+    fig = fig_ref['fig']
+    fig_ref['im_agent'].set_data(agentview_image)
+    fig_ref['im_eye'].set_data(eye_in_hand_image)
+    
+    # Info text
+    info_lines = [
+        f"Task: {task_description}",
+        "",
+        f"Step: {step}",
+        f"Reward: {reward:.4f}",
+    ]
+    if robot_state is not None:
+        info_lines.append("")
+        info_lines.append("Robot State:")
+        for i in range(0, len(robot_state), 3):
+            vals = robot_state[i:i+3]
+            info_lines.append(f"  [{i}-{i+len(vals)-1}]: " + ", ".join(f"{v:.3f}" for v in vals))
+    fig_ref['text_info'].set_text('\n'.join(info_lines))
+    
+    # ---- Update attention heatmaps ----
+    if attention_weights is not None and isinstance(attention_weights, dict):
+        # Use the same processing logic as the realtime visualizer
+        for step_idx, step_attn in attention_weights.items():
+            # Convert JAX array to numpy if needed
+            attn_np = np.array(step_attn) if hasattr(step_attn, '__array__') else step_attn
+            
+            shape = attn_np.shape
+            # Handle (batch, num_layers, heads, q, k) or (batch, heads, q, k)
+            if len(shape) == 5:
+                layer_list = [attn_np[:, i, :, :, :] for i in range(shape[1])]
+            elif len(shape) == 4 and shape[1] <= 10:
+                layer_list = [attn_np]
+            elif len(shape) == 4:
+                layer_list = [attn_np[:, i, :, :] for i in range(shape[1])]
+            else:
+                layer_list = [attn_np]
+            
+            for layer_idx, attn in enumerate(layer_list):
+                # Reduce to 2D
+                if len(attn.shape) == 4:
+                    attn = attn[0].mean(axis=0)
+                elif len(attn.shape) == 3:
+                    attn = attn[0]
+                
+                attn = np.clip(attn, 0, None)
+                a_min, a_max = attn.min(), attn.max()
+                if a_max > a_min:
+                    attn = (attn - a_min) / (a_max - a_min)
+                elif a_max > 0:
+                    attn = attn / a_max
+                
+                key = (step_idx, layer_idx)
+                if key in fig_ref['attn_images']:
+                    fig_ref['attn_images'][key].set_data(attn.astype(np.float32))
+        
+        # Draw separator rectangles once after first real data
+        if not fig_ref['rects_initialized'] and attention_weights:
+            from matplotlib.patches import Rectangle
+            first_key = next(iter(attention_weights))
+            first_attn = np.array(attention_weights[first_key]) if hasattr(attention_weights[first_key], '__array__') else attention_weights[first_key]
+            # Infer query_len from the attention shape
+            if len(first_attn.shape) == 5:
+                query_len = first_attn.shape[-2]
+                total_key_len = first_attn.shape[-1]
+            elif len(first_attn.shape) == 4:
+                query_len = first_attn.shape[-2]
+                total_key_len = first_attn.shape[-1]
+            else:
+                query_len = first_attn.shape[-2]
+                total_key_len = first_attn.shape[-1]
+            
+            action_self_attn_length = total_key_len - vlm_cache_length
+            
+            for (si, li), ax in fig_ref['attn_axes'].items():
+                # Add green dotted contour around the full attention map
+                rect_full = Rectangle((-0.5, -0.5), total_key_len, query_len,
+                                      linewidth=2, edgecolor='lime', facecolor='none', linestyle=':', alpha=0.8)
+                ax.add_patch(rect_full)
+                ax.set_xlabel(f'Key (0-{total_key_len})', fontsize=5)
+                ax.set_ylabel(f'Query (0-{query_len})', fontsize=5)
+            fig_ref['rects_initialized'] = True
+    
+    # ---- Render to array ----
+    fig.canvas.draw()
+    buf = fig.canvas.buffer_rgba()
+    frame = np.asarray(buf)[:, :, :3].copy()
+    
+    return frame, fig_ref
