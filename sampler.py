@@ -21,6 +21,7 @@ import random as py_random
 import typing
 from typing import Literal
 
+import einops
 from etils import enp
 from gemma.gm.data import _functional
 from gemma.gm.nn import _transformer_like
@@ -497,7 +498,163 @@ class Sampler:
         max_out_length=self.max_out_length,
     )
     return init_state.cache
+  
 
+  def get_top_reward(
+      self,
+      prompt,
+      *,
+      images=None,
+      rng=None,
+      last_state=None,
+      sharding=None,
+      words=None,
+  ):
+    # pylint: disable=g-docstring-quotes
+    '''Samples a string from the model.
+
+    Example:
+
+    ```python
+    prompt = """<start_of_turn>user
+    I'm hesitating between those two options:
+
+    Option 1: <start_of_image>
+    Option 2: <start_of_image>
+
+    Any thoughts ?
+    <end_of_turn>
+    <start_of_turn>model
+    """
+    sampler.sample(prompt, images=images))
+    ```
+
+    Args:
+      prompt: Prompt to sample from. Can be a single string or a list of
+        strings.
+      images: Images for the prompt. The position where the image should be
+        inserted in the prompt is determined by the `<start_of_image>` token in
+        the prompt.
+      max_new_tokens: Maximum number of new tokens to generate. The transformer
+        will process `input_length + max_new_tokens`.
+      stream: If `True`, yields tokens as they get predicted.
+      sampling: Sampling method to use. If given, will override the sampling
+        method provided in `__init__` (default: greedy).
+      rng: Seed to use for the sampling method. If `None`, a random seed is
+        used. Can be a seed `int` or a `jax.random.PRNGKey` object.
+      return_state: If `True`, returns `SamplerOutput` object with additional
+        values of the output (logits, cache,...).
+      last_state: When `return_state=True`, the state can be propagated across
+        calls to the sampler, for multi-turn conversations. Use
+        `gm.text.ChatSampler` for a simpler API which handles the state for you.
+      sharding: If provided, shard the tokens according to the specified
+        sharding. Users are responsible for ensuring the tokenized prompt is
+        compatible with the sharding. For example, if
+        `sharding=kd.sharding.FIRST_DIM`, the number of prompts must be
+        divisible by the number of devices.
+
+    Returns:
+      The sampled output.
+    '''
+
+    # Normalize the seed.
+    rng = _normalize_rng(rng)
+
+    #has_batch_dim = _get_has_batch_dim(prompt)
+    has_batch_dim = True
+    # Normalize the text, images. Tokenize, shard,...
+    inputs = self._get_inputs(
+        prompt=prompt,
+        images=images,
+        add_bos=last_state is None,  # Only add BOS for the first turn.
+        has_batch_dim=has_batch_dim,
+        sharding=sharding,
+    )
+    #print("tokens shape before prefill:", inputs.tokens.shape)
+
+    # Prefill the cache.
+    init_state = _prefill.prefill(
+        model=self.model,
+        params=self.params,
+        input=inputs,
+        last_state=last_state,
+        cache_length=self.cache_length,
+        pad_length=self.pad_length,
+        rng=rng,
+        sharding=sharding,
+        # Here we use the static `max_out_length`, as it is used to initialize
+        # the output buffer. However in the sampling loop, users can choose
+        # to only decode a subset by setting a smaller `max_new_tokens`.
+        max_out_length=self.max_out_length,
+    )
+
+    #compute the reward for the specified words as the probability of generating those tokens as the next token, given the prompt.
+    if words is None:
+        words = ["true", "True"]
+    token_ids = {word: self.tokenizer.encode(word)[0] for word in words}
+    
+    sampler = _sampler_loop.SamplerLoop(
+        # Static attributes. Changing those will trigger a recompilation.
+        model=self.model,
+        end_tokens=(
+            self.tokenizer.special_tokens.EOS,
+            self.tokenizer.special_tokens.END_OF_TURN,
+            *self._normalized_stop_tokens,
+        ),
+        forbidden_tokens=self._normalized_forbidden_tokens,
+        sampling=self.sampling,
+        cache_length=self.cache_length,
+        special_tokens=self.tokenizer.special_tokens,
+    )
+    init_state=sampler.sample(
+        # Dynamic attributes. If the shape changes, will trigger a
+        # recompilation.
+        params=self.params,
+        init_state=init_state,
+        max_new_tokens=jnp.asarray(1),  # We only need to compute the logits for the next token.
+        stream=False,  # We don't need streaming for this, as we only care about the next token.
+    )
+    txt=self._decode_state(  # pytype: disable=bad-return-type
+          init_state,
+          predicted_tokens=init_state.predicted_tokens,
+          has_batch_dim=has_batch_dim,
+          return_state=False,
+      )
+    print("decoded text from the model:", txt)
+
+    out = self.model.apply(
+          {'params': self.params},
+          tokens=init_state.last_token[..., None],
+          cache=init_state.cache,
+          positions=init_state.last_token_pos[..., None],
+          attention_mask=init_state.attention_mask_for_step[:, None, :],  # B 1 L
+      )
+    
+    logits = out.logits
+    # Logit is `B L V` with `L=1`, so collapse the L dimension.
+    logits = einops.rearrange(logits, 'B 1 V -> B V')
+    print("logits shape:", logits.shape)
+    probs = jax.nn.softmax(logits)
+    word_probs = {}
+    for word, tid in token_ids.items():
+        word_probs[word] = probs[..., tid]
+    prob_strs = ", ".join(f"{w}={p}" for w, p in word_probs.items())
+    print(f"word probs after applying the model: {prob_strs}")
+
+     # Sample next token.
+    next_rng, curr_rng = jax.random.split(init_state.rng)
+    next_token = self.sampling.get_next_tokens(logits, rng=curr_rng)
+    #convert the token id to the corresponding token string using the tokenizer.
+    next_token_str = self.tokenizer.decode(next_token)
+    print("next token:", next_token_str, "next token id:", next_token)
+
+    # Return probabilities as Python floats for downstream use
+    result = {}
+    for word, prob in word_probs.items():
+        result[f'{word}_prob'] = float(prob[0]) if prob.ndim > 0 else float(prob)
+    result['cache'] = init_state.cache
+    return result
+  
   def _get_inputs(
       self,
       *,

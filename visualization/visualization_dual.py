@@ -101,6 +101,11 @@ class RealtimeAgentVisualizerDual:
         self.diffusion_steps = [0, 4, 9]  # 1st, 5th, 10th diffusion steps
         self.attention_dims_initialized = False  # Track if dimensions have been set
         
+        # Probability curve tracking
+        self.True_probs_history = []
+        self.ax_prob_curve = None
+        self.line_True = None
+        
         # Thread safety
         self.is_running = False
         self.lock = threading.Lock()
@@ -116,13 +121,13 @@ class RealtimeAgentVisualizerDual:
             # Second row: [State Info] [VLM Prompt/Response]
             # Bottom rows: [Attention heatmaps mosaic for 3 diffusion steps × 3 layers]
             
-            self.fig = plt.figure(figsize=(18, 15), dpi=100)
+            self.fig = plt.figure(figsize=(18, 17), dpi=100)
             self.fig.suptitle('LIBERO Agent Visualization - Dual Camera with Attention', fontsize=12, fontweight='bold')
             
             # Create nested grid spec
-            # Outer grid: 3 rows (top cameras + middle info + bottom mosaic)
-            gs_outer = gridspec.GridSpec(3, 1, figure=self.fig, 
-                                         height_ratios=[1.2, 0.6, 1.5],  # Increased top row height slightly
+            # Outer grid: 4 rows (top cameras + middle info + prob curve + bottom mosaic)
+            gs_outer = gridspec.GridSpec(4, 1, figure=self.fig, 
+                                         height_ratios=[1.2, 0.6, 0.6, 1.5],
                                          hspace=0.35)
             
             # Top row subgrid: 2 rows x 2 columns for ENV and DATASET images if show_dataset_images, otherwise 1 row x 3 columns
@@ -230,6 +235,18 @@ class RealtimeAgentVisualizerDual:
                 wrap=True
             )
             
+            # ========== PROBABILITY CURVE ROW ==========
+            gs_prob = gridspec.GridSpecFromSubplotSpec(1, 1, subplot_spec=gs_outer[2])
+            self.ax_prob_curve = self.fig.add_subplot(gs_prob[0, 0])
+            self.ax_prob_curve.set_title('Task Completion Probability (Yes/No) per Replan', fontsize=9, fontweight='bold')
+            self.ax_prob_curve.set_xlabel('Replan Index', fontsize=8)
+            self.ax_prob_curve.set_ylabel('Probability', fontsize=8)
+            #self.ax_prob_curve.set_ylim(-0.05, 1.05)
+            #self.ax_prob_curve.set_xlim(0, 1)
+            self.ax_prob_curve.grid(True, alpha=0.3)
+            self.line_True, = self.ax_prob_curve.plot([], [], 'r-o', label='P(True)', markersize=4, linewidth=1.5)
+            self.ax_prob_curve.legend(loc='upper left', fontsize=7)
+            
             # ========== BOTTOM ROW: ATTENTION MOSAIC ==========
             # Dynamic layout: 3 columns (diffusion steps) × num_layers rows
             
@@ -240,7 +257,7 @@ class RealtimeAgentVisualizerDual:
             blank_attn = np.zeros((17, 273))
             
             # Dynamically create grid spec based on num_layers
-            gs_mosaic = gridspec.GridSpecFromSubplotSpec(self.num_layers, 4, subplot_spec=gs_outer[2], 
+            gs_mosaic = gridspec.GridSpecFromSubplotSpec(self.num_layers, 4, subplot_spec=gs_outer[3], 
                                                           hspace=0.25, wspace=0.4)
             
             # Create rows for each layer
@@ -585,6 +602,7 @@ class RealtimeAgentVisualizerDual:
         diffusion_step_attentions: Optional[dict] = None,
         vlm_prompt: Optional[str] = None,
         vlm_response: Optional[str] = None,
+        True_probs: Optional[List[float]] = None,
         **kwargs
     ):
         """
@@ -677,6 +695,11 @@ class RealtimeAgentVisualizerDual:
             if done is not None:
                 info_lines.append(f"Done: {done}")
             
+            # Show latest True probability
+            if self.True_probs_history:
+                info_lines.append("")
+                info_lines.append(f"P(True): {self.True_probs_history[-1]:.4f}")
+            
             info_lines.append("")
             
             # Show recent actions
@@ -730,6 +753,18 @@ class RealtimeAgentVisualizerDual:
             
             if hasattr(self, 'text_vlm') and self.text_vlm is not None:
                 self.text_vlm.set_text('\n'.join(vlm_lines))
+            
+            # Update probability curve
+            if True_probs is not None and self.ax_prob_curve is not None:
+                self.True_probs_history = list(True_probs)
+                n = len(self.True_probs_history)
+                if n > 0:
+                    x = list(range(1, n + 1))
+                    self.line_True.set_data(x, self.True_probs_history)
+                    self.ax_prob_curve.set_xlim(0.5, max(n + 0.5, 2))
+                    self.ax_prob_curve.set_xticks(x)
+                    self.ax_prob_curve.relim()
+                    self.ax_prob_curve.autoscale_view(scalex=False, scaley=True)
     
     def _wrap_text(self, text: str, width: int = 80) -> list:
         """
@@ -856,9 +891,11 @@ def render_attention_video_frame(
     cache_layers: Optional[List[str]] = None,
     vlm_cache_length: int = 256,
     fig_ref: Optional[dict] = None,
+    True_probs: Optional[List[float]] = None,
 ) -> Tuple[np.ndarray, Optional[dict]]:
     """
-    Render a single video frame with dual camera views and attention heatmaps.
+    Render a single video frame with dual camera views, attention heatmaps,
+    and a task-completion probability curve.
     
     Creates a matplotlib figure matching the realtime visualization layout,
     renders it to a numpy array, and returns it. The figure is reused across
@@ -876,6 +913,7 @@ def render_attention_video_frame(
         vlm_cache_length: Number of VLM cache keys (boundary for highlighting)
         fig_ref: Mutable dict to persist figure state between calls.
                  Pass {} on first call; it will be populated with reusable objects.
+        True_probs: List of P(True) values (one per replan so far)
     
     Returns:
         Tuple of (frame_array, fig_ref):
@@ -896,10 +934,10 @@ def render_attention_video_frame(
         fig_ref = {}
     
     if 'fig' not in fig_ref:
-        fig = plt.figure(figsize=(18, 12), dpi=150)
+        fig = plt.figure(figsize=(18, 14), dpi=150)
         fig.suptitle('Trajectory Visualization with Attention Maps', fontsize=12, fontweight='bold')
         
-        gs_outer = gridspec.GridSpec(2, 1, figure=fig, height_ratios=[1.0, 1.5], hspace=0.30)
+        gs_outer = gridspec.GridSpec(3, 1, figure=fig, height_ratios=[1.0, 0.5, 1.5], hspace=0.30)
         
         # Top row: [agentview] [eye-in-hand] [info]
         gs_top = gridspec.GridSpecFromSubplotSpec(1, 3, subplot_spec=gs_outer[0], wspace=0.3)
@@ -921,9 +959,21 @@ def render_attention_video_frame(
             fontsize=8, verticalalignment='top', family='monospace'
         )
         
+        # Middle row: probability curve
+        gs_prob = gridspec.GridSpecFromSubplotSpec(1, 1, subplot_spec=gs_outer[1])
+        ax_prob = fig.add_subplot(gs_prob[0, 0])
+        ax_prob.set_title('Task Completion Probability (Yes/No) per Replan', fontsize=9, fontweight='bold')
+        ax_prob.set_xlabel('Replan Index', fontsize=8)
+        ax_prob.set_ylabel('Probability', fontsize=8)
+        #ax_prob.set_ylim(-0.05, 1.05)
+        #ax_prob.set_xlim(0, 1)
+        ax_prob.grid(True, alpha=0.3)
+        line_True, = ax_prob.plot([], [], 'r-o', label='P(True)', markersize=4, linewidth=1.5)
+        ax_prob.legend(loc='upper left', fontsize=7)
+        
         # Bottom: attention mosaic  (num_layers rows × 3 columns + colorbar column)
         gs_mosaic = gridspec.GridSpecFromSubplotSpec(
-            num_layers, 4, subplot_spec=gs_outer[1], hspace=0.30, wspace=0.40
+            num_layers, 4, subplot_spec=gs_outer[2], hspace=0.30, wspace=0.40
         )
         
         attn_axes = {}
@@ -960,6 +1010,8 @@ def render_attention_video_frame(
         fig_ref['attn_axes'] = attn_axes
         fig_ref['attn_images'] = attn_images
         fig_ref['rects_initialized'] = False
+        fig_ref['ax_prob'] = ax_prob
+        fig_ref['line_True'] = line_True
     
     # ---- Update data ----
     fig = fig_ref['fig']
@@ -973,6 +1025,9 @@ def render_attention_video_frame(
         f"Step: {step}",
         f"Reward: {reward:.4f}",
     ]
+    if True_probs is not None and len(True_probs) > 0:
+        info_lines.append("")
+        info_lines.append(f"P(True): {True_probs[-1]:.4f}")
     if robot_state is not None:
         info_lines.append("")
         info_lines.append("Robot State:")
@@ -980,6 +1035,17 @@ def render_attention_video_frame(
             vals = robot_state[i:i+3]
             info_lines.append(f"  [{i}-{i+len(vals)-1}]: " + ", ".join(f"{v:.3f}" for v in vals))
     fig_ref['text_info'].set_text('\n'.join(info_lines))
+    
+    # ---- Update probability curve ----
+    if True_probs is not None and 'ax_prob' in fig_ref:
+        n = len(True_probs)
+        if n > 0:
+            x = list(range(1, n + 1))
+            fig_ref['line_True'].set_data(x, True_probs)
+            fig_ref['ax_prob'].set_xlim(0.5, max(n + 0.5, 2))
+            fig_ref['ax_prob'].set_xticks(x)
+            fig_ref['ax_prob'].relim()
+            fig_ref['ax_prob'].autoscale_view(scalex=False, scaley=True)
     
     # ---- Update attention heatmaps ----
     if attention_weights is not None and isinstance(attention_weights, dict):
