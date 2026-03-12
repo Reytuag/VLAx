@@ -16,3 +16,5 @@ Next steps include:
 
 ![Attention_demo](vis_videos/attention_vis.png)
 
+
+Added [TOPReward](https://topreward.github.io/webpage/) reward estimation test to explore this direction. Both with single image estimation (see ![video](vis_videos/task9_top_reward_attempt.mp4)) as well as video (image stacking) estimation (see ![video](vis_videos/task9_top_reward_video_attempt.mp4)). The results are interesting but not as clean as reported in the paper potentially due to smaller model (gemma3 4b vs Qwen3-VL-8B) + quantization + the reduction of number of token per image I use due to GPU VRAM constraints I have. 
